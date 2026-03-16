@@ -1,0 +1,96 @@
+import numpy as np
+import pandas as pd
+from scipy.optimize import least_squares
+
+from .physics import vbar_from_components, nfw_velocity
+
+
+def fit_nfw_to_galaxy(
+    df: pd.DataFrame,
+    error_floor: float = 2.0,
+    ups_disk: float = 0.5,
+    ups_bulge: float = 0.7,
+) -> dict:
+    r = df["Rad"].values
+    vobs = df["Vobs"].values
+    err = np.maximum(df["errV"].values, error_floor)
+    vbar = vbar_from_components(df, ups_disk=ups_disk, ups_bulge=ups_bulge)
+
+    def residuals(theta):
+        log10_M200, log10_rs = theta
+        M200 = 10**log10_M200
+        rs = 10**log10_rs
+        vdm = nfw_velocity(r, M200, rs)
+        vtot = np.sqrt(vbar**2 + vdm**2)
+        return (vtot - vobs) / err
+
+    lower = np.array([9.0, -0.5])
+    upper = np.array([14.0, 2.0])
+    x0 = np.array([11.5, 1.0])
+
+    result = least_squares(
+        residuals,
+        x0=x0,
+        bounds=(lower, upper),
+        method="trf",
+        max_nfev=5000,
+    )
+
+    log10_M200, log10_rs = result.x
+    M200 = 10**log10_M200
+    rs = 10**log10_rs
+
+    vdm = nfw_velocity(r, M200, rs)
+    vtot = np.sqrt(vbar**2 + vdm**2)
+
+    chi2 = np.sum(((vtot - vobs) / err) ** 2)
+    dof = max(len(r) - 2, 1)
+    chi2_red = chi2 / dof
+
+    return {
+        "galaxy": df["galaxy"].iloc[0],
+        "n_points": len(df),
+        "distance_mpc": df["distance_mpc"].iloc[0],
+        "low_point_fit": bool(len(df) < 8),
+        "log10_M200": log10_M200,
+        "log10_rs": log10_rs,
+        "M200": M200,
+        "rs": rs,
+        "chi2_red": chi2_red,
+        "success": bool(result.success),
+        "status": int(result.status),
+        "nfev": int(result.nfev),
+        "hit_lower_mass": bool(np.isclose(log10_M200, lower[0], atol=1e-3)),
+        "hit_upper_mass": bool(np.isclose(log10_M200, upper[0], atol=1e-3)),
+        "hit_lower_rs": bool(np.isclose(log10_rs, lower[1], atol=1e-3)),
+        "hit_upper_rs": bool(np.isclose(log10_rs, upper[1], atol=1e-3)),
+    }
+
+
+def fit_all_galaxies(galaxy_dfs: list[pd.DataFrame], error_floor: float = 2.0) -> pd.DataFrame:
+    records = []
+    for df in galaxy_dfs:
+        try:
+            rec = fit_nfw_to_galaxy(df, error_floor=error_floor)
+        except Exception:
+            rec = {
+                "galaxy": df["galaxy"].iloc[0],
+                "n_points": len(df),
+                "distance_mpc": df["distance_mpc"].iloc[0],
+                "low_point_fit": bool(len(df) < 8),
+                "log10_M200": np.nan,
+                "log10_rs": np.nan,
+                "M200": np.nan,
+                "rs": np.nan,
+                "chi2_red": np.nan,
+                "success": False,
+                "status": -999,
+                "nfev": np.nan,
+                "hit_lower_mass": False,
+                "hit_upper_mass": False,
+                "hit_lower_rs": False,
+                "hit_upper_rs": False,
+            }
+        records.append(rec)
+
+    return pd.DataFrame(records)
