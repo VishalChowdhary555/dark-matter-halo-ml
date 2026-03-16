@@ -1,0 +1,131 @@
+import os
+import re
+import glob
+import zipfile
+import requests
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+
+
+def download_file(url: str, out_path: str, timeout: int = 180) -> None:
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()
+    with open(out_path, "wb") as f:
+        f.write(response.content)
+
+
+def download_zip(urls: tuple[str, ...], zip_path: str, logger=print) -> None:
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+
+    last_error = None
+    for url in urls:
+        try:
+            logger(f"Trying download: {url}")
+            download_file(url, zip_path)
+            size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+            logger(f"Downloaded zip successfully. Size = {size_mb:.2f} MB")
+            return
+        except Exception as exc:
+            last_error = exc
+            logger(f"Download failed from {url}: {exc}")
+
+    raise RuntimeError(f"All downloads failed. Last error: {last_error}")
+
+
+def extract_zip(zip_path: str, extract_dir: str, logger=print) -> None:
+    if os.path.exists(extract_dir):
+        import shutil
+        shutil.rmtree(extract_dir)
+    os.makedirs(extract_dir, exist_ok=True)
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(extract_dir)
+
+    logger("Extraction complete.")
+
+
+def find_rotmod_files(root_dir: str) -> list[str]:
+    return sorted(glob.glob(os.path.join(root_dir, "**", "*rotmod*.dat"), recursive=True))
+
+
+def read_sparc_rotmod(filepath: str, min_points: int = 8) -> pd.DataFrame | None:
+    galaxy_name = os.path.basename(filepath).replace("_rotmod.dat", "").replace(".dat", "")
+    rows = []
+    distance_mpc = np.nan
+
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+
+            if not line:
+                continue
+
+            if line.startswith("#"):
+                match = re.search(r"Distance\s*=\s*([0-9.]+)", line)
+                if match:
+                    distance_mpc = float(match.group(1))
+                continue
+
+            parts = line.split()
+            numeric_vals = []
+            for token in parts:
+                try:
+                    numeric_vals.append(float(token))
+                except ValueError:
+                    pass
+
+            if len(numeric_vals) >= 6:
+                rows.append(numeric_vals[:8] if len(numeric_vals) >= 8 else numeric_vals[:6])
+
+    if not rows:
+        return None
+
+    max_cols = max(len(row) for row in rows)
+    cleaned_rows = []
+    for row in rows:
+        if len(row) < 6:
+            continue
+        if len(row) < max_cols:
+            row = row + [np.nan] * (max_cols - len(row))
+        cleaned_rows.append(row)
+
+    if not cleaned_rows:
+        return None
+
+    if max_cols >= 8:
+        cols = ["Rad", "Vobs", "errV", "Vgas", "Vdisk", "Vbul", "SBdisk", "SBbul"]
+        df = pd.DataFrame(cleaned_rows, columns=cols[:max_cols]).iloc[:, :8]
+        df.columns = cols
+    else:
+        cols = ["Rad", "Vobs", "errV", "Vgas", "Vdisk", "Vbul"]
+        df = pd.DataFrame(cleaned_rows, columns=cols[:max_cols]).iloc[:, :6]
+        df.columns = cols
+
+    df["galaxy"] = galaxy_name
+    df["distance_mpc"] = distance_mpc
+
+    keep_cols = ["Rad", "Vobs", "errV", "Vgas", "Vdisk", "Vbul"]
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=keep_cols)
+    df = df[df["Rad"] > 0].sort_values("Rad").reset_index(drop=True)
+
+    if len(df) < min_points:
+        return None
+
+    return df
+
+
+def parse_all_galaxies(dat_files: list[str], min_points: int = 8) -> tuple[list[pd.DataFrame], list[str]]:
+    galaxy_dfs = []
+    rejected_files = []
+
+    for fp in tqdm(dat_files, desc="Parsing galaxy files"):
+        df = read_sparc_rotmod(fp, min_points=min_points)
+        if df is None:
+            rejected_files.append(fp)
+        else:
+            galaxy_dfs.append(df)
+
+    return galaxy_dfs, rejected_files
